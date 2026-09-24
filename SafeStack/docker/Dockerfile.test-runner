@@ -1,0 +1,20 @@
+# SafeStack Isolated Test Runner
+FROM node:18-alpine
+
+# Install git, bash, and python for build tooling if needed
+RUN apk add --no-cache bash git python3 make g++
+
+# Create non-root user for executing untrusted project code
+RUN addgroup -S safestack && adduser -S safestack -G safestack
+
+# Set working directory
+WORKDIR /workspace
+
+# Set default environment variables
+ENV NODE_ENV=test
+ENV CI=true
+ENV NPM_CONFIG_AUDIT=false
+ENV NPM_CONFIG_UPDATE_NOTIFIER=false
+
+# Default command
+CMD ["npm", "test"]

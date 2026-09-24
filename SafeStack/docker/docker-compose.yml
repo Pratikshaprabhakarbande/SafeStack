@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:6-jammy
+    container_name: safestack-mongodb
+    restart: always
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: safestack
+    volumes:
+      - mongodb_data:/data/db
+
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test-runner
+    image: safestack-test-runner:latest
+    container_name: safestack-test-runner-base
+    restart: "no"
+    network_mode: bridge
+
+volumes:
+  mongodb_data:
