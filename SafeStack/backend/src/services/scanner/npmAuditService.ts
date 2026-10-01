@@ -66,6 +66,7 @@ export class NpmAuditService {
     packageName: string;
     currentVersion: string;
     recommendedVersion?: string;
+    vulnerableRange?: string;
     severity: 'critical' | 'high' | 'medium' | 'low';
     title: string;
     description: string;
@@ -118,6 +119,7 @@ export class NpmAuditService {
               packageName,
               currentVersion: vulnData.range || 'unknown',
               recommendedVersion: derivedFixed,
+              vulnerableRange: via.range || vulnData.range,
               severity: this.mapSeverity(via.severity),
               title: via.title,
               description: via.url || via.title,

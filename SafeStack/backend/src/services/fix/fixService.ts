@@ -10,6 +10,7 @@ import Scan from '../../models/Scan';
 import Project from '../../models/Project';
 import { TestRunnerService, TestRunResult } from './testRunnerService';
 import { ReScanService } from '../scanner/reScanService';
+import { VersionValidator } from './versionValidator';
 import config from '../../config/environment';
 import logger from '../../utils/logger';
 
@@ -140,12 +141,145 @@ export class FixService {
 
       await Fix.findByIdAndUpdate(fixId, { packagesBefore });
 
-      // Step 4: Determine target safe version
+      // Step 4: Determine target safe version with validation
       const packageName: string = vulnerability.packageName;
-      const targetVersion = targetVersionOverride || vulnerability.recommendedVersion || 'latest';
       const fromVersion = this.findCurrentVersion(packageJson, packageName);
+      const installedVersion = fromVersion || vulnerability.currentVersion || 'unknown';
 
-      // Step 5: Update package.json target dependency safely
+      // Extract vulnerable range from advisory data
+      const vulnerableRange = vulnerability.vulnerableRange || vulnerability.currentVersion || undefined;
+
+      // Determine the advisory's fixed version (from scanner data, NOT hardcoded)
+      const advisoryFixedVersion = targetVersionOverride || vulnerability.recommendedVersion;
+
+      // If no advisory fixed version is available, we cannot safely auto-fix
+      if (!advisoryFixedVersion) {
+        logger.warn('Fix: no verified safe version available from advisory data', {
+          fixId,
+          packageName,
+          installedVersion,
+        });
+
+        await Fix.findByIdAndUpdate(fixId, {
+          status: 'manual_review_required',
+          completedAt: new Date(),
+          errorMessage: 'SafeStack could not determine a verified safe upgrade. Manual review required.',
+          versionValidation: {
+            isValid: false,
+            isDowngrade: false,
+            currentVersion: installedVersion,
+            recommendedVersion: 'unknown',
+            reason: 'No advisory-recommended version available.',
+            registryVerified: false,
+          },
+        });
+
+        await Vulnerability.findByIdAndUpdate(vulnerability._id, { status: 'open' });
+        return;
+      }
+
+      // Use VersionValidator to derive the safe version
+      const safeVersionResult = VersionValidator.determineSafeVersion(
+        installedVersion,
+        advisoryFixedVersion,
+        vulnerableRange
+      );
+
+      const targetVersion = safeVersionResult.version;
+
+      if (!targetVersion) {
+        // Current version is already at or above the fix — no upgrade needed
+        logger.info('Fix: current version is already safe or no upgrade path found', {
+          fixId,
+          packageName,
+          installedVersion,
+          advisoryFixedVersion,
+          reason: safeVersionResult.reason,
+        });
+
+        // Check if this is specifically a downgrade scenario
+        const comparison = VersionValidator.compareSemver(
+          VersionValidator.cleanVersion(advisoryFixedVersion),
+          VersionValidator.cleanVersion(installedVersion)
+        );
+
+        const status = comparison < 0 ? 'unsafe_downgrade' : 'manual_review_required';
+
+        await Fix.findByIdAndUpdate(fixId, {
+          status,
+          completedAt: new Date(),
+          errorMessage: safeVersionResult.reason,
+          versionValidation: {
+            isValid: false,
+            isDowngrade: comparison < 0,
+            currentVersion: installedVersion,
+            recommendedVersion: advisoryFixedVersion,
+            reason: safeVersionResult.reason,
+            registryVerified: false,
+            advisoryFixedVersion,
+            vulnerableRange,
+          },
+        });
+
+        await Vulnerability.findByIdAndUpdate(vulnerability._id, { status: 'open' });
+        return;
+      }
+
+      // Step 5: Validate version with full safety checks
+      const validation = await VersionValidator.validateVersionSelection(
+        packageName,
+        installedVersion,
+        targetVersion,
+        vulnerableRange
+      );
+
+      logger.info('Fix: version validation result', {
+        fixId,
+        packageName,
+        validation,
+      });
+
+      // Save validation result regardless of outcome
+      await Fix.findByIdAndUpdate(fixId, { versionValidation: validation });
+
+      // CRITICAL: Reject unsafe downgrades — STOP automated fix
+      if (validation.isDowngrade) {
+        logger.error('Fix: REJECTED — unsafe downgrade detected', {
+          fixId,
+          packageName,
+          currentVersion: validation.currentVersion,
+          recommendedVersion: validation.recommendedVersion,
+        });
+
+        await Fix.findByIdAndUpdate(fixId, {
+          status: 'unsafe_downgrade',
+          completedAt: new Date(),
+          errorMessage: validation.reason,
+        });
+
+        await Vulnerability.findByIdAndUpdate(vulnerability._id, { status: 'open' });
+        return; // DO NOT create a PR for a downgrade
+      }
+
+      // Reject if validation fails for other reasons
+      if (!validation.isValid) {
+        logger.warn('Fix: version validation failed', {
+          fixId,
+          packageName,
+          reason: validation.reason,
+        });
+
+        await Fix.findByIdAndUpdate(fixId, {
+          status: 'manual_review_required',
+          completedAt: new Date(),
+          errorMessage: validation.reason,
+        });
+
+        await Vulnerability.findByIdAndUpdate(vulnerability._id, { status: 'open' });
+        return;
+      }
+
+      // Step 6: Update package.json target dependency safely
       await Fix.findByIdAndUpdate(fixId, { status: 'updating_deps' });
 
       const updated = this.updatePackageVersion(packageJson, packageName, targetVersion);
@@ -155,7 +289,7 @@ export class FixService {
 
       fs.writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2) + '\n', 'utf-8');
 
-      // Step 6: Controlled update of package-lock.json (NEVER use npm audit fix --force)
+      // Step 7: Controlled update of package-lock.json (NEVER use npm audit fix --force)
       try {
         await execAsync('npm install --package-lock-only', {
           cwd: workingDir,
@@ -231,35 +365,57 @@ export class FixService {
           originalStats
         );
 
-        // Commit changes to fix branch
-        try {
-          await git.add(['package.json', 'package-lock.json']);
-          await git.commit(
-            `fix(deps): update ${packageName} from ${fromVersion} to ${actualToVersion} [SafeStack]`
-          );
-        } catch (commitErr: any) {
-          logger.warn('Failed to commit in fix branch', { error: commitErr.message });
+        // CRITICAL: Only mark as completed if re-scan confirms resolution
+        if (reScanResult.isResolved) {
+          // Commit changes to fix branch
+          try {
+            await git.add(['package.json', 'package-lock.json']);
+            await git.commit(
+              `fix(deps): update ${packageName} from ${fromVersion} to ${actualToVersion} [SafeStack]`
+            );
+          } catch (commitErr: any) {
+            logger.warn('Failed to commit in fix branch', { error: commitErr.message });
+          }
+
+          await Fix.findByIdAndUpdate(fixId, {
+            status: 'completed',
+            completedAt: new Date(),
+            reScanResult,
+          });
+
+          // Mark vulnerability as resolved in database
+          await Vulnerability.findByIdAndUpdate(vulnerability._id, {
+            status: 'fixed',
+            resolvedAt: new Date(),
+          });
+
+          logger.info('Fix: applied, tested, and re-scanned successfully', {
+            fixId,
+            packageName,
+            fromVersion,
+            toVersion: actualToVersion,
+            isResolved: true,
+          });
+        } else {
+          // Re-scan shows vulnerability is NOT resolved despite update
+          logger.warn('Fix: re-scan shows vulnerability still present after update', {
+            fixId,
+            packageName,
+            fromVersion,
+            toVersion: actualToVersion,
+            isResolved: false,
+            remainingVulnerabilities: reScanResult.remainingVulnerabilities?.length,
+          });
+
+          await Fix.findByIdAndUpdate(fixId, {
+            status: 'manual_review_required',
+            completedAt: new Date(),
+            reScanResult,
+            errorMessage: `Re-scan detected that ${packageName} vulnerability is still present after updating to ${actualToVersion}. The fix did not resolve the vulnerability. Manual review required.`,
+          });
+
+          await Vulnerability.findByIdAndUpdate(vulnerability._id, { status: 'open' });
         }
-
-        await Fix.findByIdAndUpdate(fixId, {
-          status: 'completed',
-          completedAt: new Date(),
-          reScanResult,
-        });
-
-        // Mark vulnerability as resolved in database
-        await Vulnerability.findByIdAndUpdate(vulnerability._id, {
-          status: 'fixed',
-          resolvedAt: new Date(),
-        });
-
-        logger.info('Fix: applied, tested, and re-scanned successfully', {
-          fixId,
-          packageName,
-          fromVersion,
-          toVersion: actualToVersion,
-          isResolved: reScanResult.isResolved,
-        });
       } else {
         // Test failed -> Compatibility issue
         logger.warn('Fix: tests failed after update', { fixId, exitCode: testResult.exitCode });
@@ -305,7 +461,7 @@ export class FixService {
     const packageJsonPath = path.join(fix.workingDir, 'package.json');
     const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
     const packageName = vulnerability.packageName;
-    const currentVer = vulnerability.currentVersion;
+    const currentVer = this.findCurrentVersion(packageJson, packageName) || vulnerability.currentVersion;
 
     // Derive a conservative minor/patch target version
     const cleanVer = currentVer.replace(/[^0-9.]/g, '');
@@ -315,6 +471,26 @@ export class FixService {
     if (parts.length >= 2) {
       const nextMinor = `${parts[0]}.${parseInt(parts[1], 10) + 1}.0`;
       conservativeVersion = `^${nextMinor}`;
+    }
+
+    // Validate that the conservative version is not a downgrade
+    const cleanConservative = VersionValidator.cleanVersion(conservativeVersion);
+    const comparison = VersionValidator.compareSemver(cleanConservative, VersionValidator.cleanVersion(currentVer));
+    if (comparison < 0) {
+      logger.warn('Retry: conservative version would be a downgrade, aborting', {
+        fixId,
+        packageName,
+        currentVer,
+        conservativeVersion,
+      });
+
+      await Fix.findByIdAndUpdate(fixId, {
+        status: 'unsafe_downgrade',
+        resolutionAttempted: true,
+        resolutionSuccessful: false,
+        errorMessage: `Conservative version ${conservativeVersion} would downgrade ${packageName} from ${currentVer}. Manual review required.`,
+      });
+      return false;
     }
 
     logger.info('Retrying fix with compatible version', { fixId, packageName, conservativeVersion });

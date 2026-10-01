@@ -199,21 +199,31 @@ export class PullRequestService {
     pkgUpdate: any
   ): string {
     const reScan = fix.reScanResult;
+    const vv = fix.versionValidation;
     const testStatus = fix.testsRun
       ? fix.testsPassed
         ? '✅ All compatibility tests passed'
         : '⚠️ Tests had warnings/issues'
       : 'ℹ️ No tests configured';
 
+    const advisoryId = vulnerability.cveId || vulnerability.osvId || 'N/A';
+    const whyVersion = vv?.reason
+      || `Advisory recommends updating to ${pkgUpdate.toVersion} to resolve ${vulnerability.title}.`;
+
     return `## 🔒 SafeStack Automated Security Fix
 
 ### 📦 Vulnerability Summary
-- **Package:** \`${pkgUpdate.name}\`
-- **Current Version:** \`${pkgUpdate.fromVersion}\`
-- **Updated Version:** \`${pkgUpdate.toVersion}\`
-- **Severity:** **${vulnerability.severity.toUpperCase()}**
-- **Identifier:** \`${vulnerability.cveId || vulnerability.osvId || 'N/A'}\`
-- **Title:** ${vulnerability.title}
+| Field | Value |
+| :--- | :--- |
+| **Package** | \`${pkgUpdate.name}\` |
+| **Current version** | \`${pkgUpdate.fromVersion}\` |
+| **Recommended version** | \`${pkgUpdate.toVersion}\` |
+| **Vulnerability** | ${vulnerability.title} |
+| **Severity** | **${vulnerability.severity.toUpperCase()}** |
+| **Advisory/CVE/GHSA/OSV identifier** | \`${advisoryId}\` |
+| **Why this version was selected** | ${whyVersion} |
+| **Compatibility test result** | ${testStatus} |
+| **Registry verified** | ${vv?.registryVerified ? '✅ Yes' : '⚠️ Not verified'} |
 
 ### 💡 Description & AI Rationale
 ${vulnerability.aiExplanation || vulnerability.description}
@@ -227,13 +237,15 @@ ${fix.testOutput ? `\`\`\`\n${fix.testOutput.slice(0, 500)}\n\`\`\`` : ''}
 ### 📊 Security Re-Scan Delta
 ${
   reScan?.comparison
-    ? `| Severity | Before | After | Delta |
+    ? `| Severity | Before scan | After scan | Security delta |
 | :--- | :--- | :--- | :--- |
 | **Critical** | ${reScan.comparison.critical.before} | ${reScan.comparison.critical.after} | ${reScan.comparison.critical.after - reScan.comparison.critical.before} |
 | **High** | ${reScan.comparison.high.before} | ${reScan.comparison.high.after} | ${reScan.comparison.high.after - reScan.comparison.high.before} |
 | **Medium** | ${reScan.comparison.medium.before} | ${reScan.comparison.medium.after} | ${reScan.comparison.medium.after - reScan.comparison.medium.before} |
 | **Low** | ${reScan.comparison.low.before} | ${reScan.comparison.low.after} | ${reScan.comparison.low.after - reScan.comparison.low.before} |
-| **Total** | ${reScan.comparison.total.before} | ${reScan.comparison.total.after} | **${reScan.comparison.total.after - reScan.comparison.total.before}** |`
+| **Total** | ${reScan.comparison.total.before} | ${reScan.comparison.total.after} | **${reScan.comparison.total.after - reScan.comparison.total.before}** |
+
+**Vulnerability resolved:** ${reScan.isResolved ? '✅ Yes' : '❌ No — still detected after update'}`
     : 'Re-scan verified that the target vulnerability is resolved.'
 }
 
