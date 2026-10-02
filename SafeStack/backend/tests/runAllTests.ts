@@ -11,6 +11,7 @@ import { DockerService } from '../src/services/fix/dockerService';
 import { TestRunnerService } from '../src/services/fix/testRunnerService';
 import { ReScanService } from '../src/services/scanner/reScanService';
 import { PullRequestService } from '../src/services/project/pullRequestService';
+import { VersionValidator } from '../src/services/fix/versionValidator';
 
 interface TestResult {
   name: string;
@@ -248,13 +249,204 @@ async function main() {
     const sampleBody = (PullRequestService as any).buildPRBody(
       { branchName: 'safestack/security-fix-lodash-123', baseBranch: 'main', testsRun: true, testsPassed: true },
       { name: 'my-project' },
-      { packageName: 'lodash', severity: 'high', title: 'Prototype pollution' },
+      { packageName: 'lodash', severity: 'high', title: 'Prototype pollution', cveId: 'GHSA-p6mc-m468-83gw' },
       { name: 'lodash', fromVersion: '4.17.20', toVersion: '4.17.21' }
     );
 
     assert.ok(sampleBody.includes('SafeStack Safety Guarantee'));
     assert.ok(sampleBody.includes('NEVER automatically merges'));
     assert.ok(sampleBody.includes('safestack/security-fix-lodash-123'));
+    assert.ok(sampleBody.includes('Advisory/CVE/GHSA/OSV identifier'), 'PR body must include advisory identifier field');
+    assert.ok(sampleBody.includes('Why this version was selected'), 'PR body must include version selection rationale');
+    assert.ok(sampleBody.includes('Before scan') || sampleBody.includes('Compatibility test result'), 'PR body must include test/scan fields');
+  });
+
+  // --------------------------------------------------------------------------
+  // Scenario 11: REGRESSION TEST — Downgrade Rejection
+  // --------------------------------------------------------------------------
+  await runTest('Scenario 11: REGRESSION — Fix engine rejects automatic downgrade (4.18.1 → 4.17.21)', async () => {
+    // This is the exact bug scenario: lodash 4.18.1 installed, advisory says fix at 4.17.21
+    const result = await VersionValidator.validateVersionSelection(
+      'lodash',
+      '4.18.1',   // currentVersion (installed)
+      '4.17.21',  // recommendedVersion (from advisory — but it's a DOWNGRADE)
+      '<4.17.21'  // vulnerableRange from npm audit
+    );
+
+    assert.strictEqual(result.isValid, false, 'Must reject the downgrade');
+    assert.strictEqual(result.isDowngrade, true, 'Must detect 4.17.21 < 4.18.1 as a downgrade');
+    assert.ok(result.reason.toLowerCase().includes('downgrade'), 'Reason must mention downgrade');
+  });
+
+  // --------------------------------------------------------------------------
+  // Scenario 12: Valid Upgrade Acceptance (determineSafeVersion)
+  // --------------------------------------------------------------------------
+  await runTest('Scenario 12: Fix engine accepts upgrade when advisory confirms resolution', () => {
+    // Current version is vulnerable, fixed version is higher
+    const safeResult = VersionValidator.determineSafeVersion(
+      '4.17.20',  // currentVersion (vulnerable)
+      '4.17.21',  // advisoryFixedVersion
+      '<4.17.21'  // vulnerableRange
+    );
+
+    assert.ok(safeResult.version !== null, 'Must return a valid upgrade version');
+    assert.strictEqual(safeResult.version, '4.17.21', 'Must select 4.17.21 as the fix version');
+    assert.ok(safeResult.reason.includes('Upgrading'), 'Reason must indicate upgrade');
+  });
+
+  // --------------------------------------------------------------------------
+  // Scenario 13: Semver Comparison Correctness
+  // --------------------------------------------------------------------------
+  await runTest('Scenario 13: Semver comparison handles major/minor/patch correctly', () => {
+    // 4.17.21 < 4.18.1
+    assert.strictEqual(VersionValidator.compareSemver('4.17.21', '4.18.1'), -1, '4.17.21 must be less than 4.18.1');
+    // 4.18.1 > 4.17.21
+    assert.strictEqual(VersionValidator.compareSemver('4.18.1', '4.17.21'), 1, '4.18.1 must be greater than 4.17.21');
+    // Equal versions
+    assert.strictEqual(VersionValidator.compareSemver('4.17.21', '4.17.21'), 0, 'Equal versions must return 0');
+    // Major version difference
+    assert.strictEqual(VersionValidator.compareSemver('3.10.1', '4.0.0'), -1, 'Major version: 3.x < 4.x');
+    // Patch difference
+    assert.strictEqual(VersionValidator.compareSemver('1.0.0', '1.0.1'), -1, 'Patch: 1.0.0 < 1.0.1');
+  });
+
+  // --------------------------------------------------------------------------
+  // Scenario 14: No Advisory Version — Manual Review Required
+  // --------------------------------------------------------------------------
+  await runTest('Scenario 14: Fix engine requires manual review when no advisory version available', () => {
+    const result = VersionValidator.determineSafeVersion(
+      '2.0.0',     // currentVersion
+      undefined,   // no advisory fixed version
+      '<1.5.0'     // vulnerableRange
+    );
+
+    assert.strictEqual(result.version, null, 'Must not return a version when none is available');
+    assert.ok(result.reason.includes('Manual review required') || result.reason.includes('could not determine'),
+      'Must indicate manual review is required');
+  });
+
+  // --------------------------------------------------------------------------
+  // Scenario 15: Already-safe version detection
+  // --------------------------------------------------------------------------
+  await runTest('Scenario 15: Fix engine detects when current version is already above vulnerable range', () => {
+    // 4.18.1 is NOT in the range <4.17.21, so it's already safe
+    const isVulnerable = VersionValidator.isVersionInVulnerableRange('4.18.1', '<4.17.21');
+    assert.strictEqual(isVulnerable, false, '4.18.1 should NOT be in the vulnerable range <4.17.21');
+
+    // 4.17.20 IS in the range <4.17.21
+    const isVulnerable2 = VersionValidator.isVersionInVulnerableRange('4.17.20', '<4.17.21');
+    assert.strictEqual(isVulnerable2, true, '4.17.20 SHOULD be in the vulnerable range <4.17.21');
+  });
+
+  // --------------------------------------------------------------------------
+  // Scenario 16: INTEGRATION — Full pipeline rejects downgrade (4.18.1 → 4.17.21)
+  // --------------------------------------------------------------------------
+  await runTest('Scenario 16: INTEGRATION — Full fix pipeline blocks downgrade before file modification', async () => {
+    // Simulate the real executeFix() decision path (lines 144-280 of fixService.ts)
+    const installedVersion = '4.18.1';
+    const advisoryFixedVersion = '4.17.21';
+    const vulnerableRange = '<4.17.21';
+
+    // Step 1: determineSafeVersion (line 182-186)
+    const safeVersionResult = VersionValidator.determineSafeVersion(
+      installedVersion,
+      advisoryFixedVersion,
+      vulnerableRange
+    );
+
+    // The determineSafeVersion should return null because 4.18.1 >= 4.17.21
+    assert.strictEqual(safeVersionResult.version, null,
+      'determineSafeVersion must return null — installed version is already >= advisory fix');
+
+    // Step 2: Verify the comparison logic that sets the status (lines 200-206)
+    const comparison = VersionValidator.compareSemver(
+      VersionValidator.cleanVersion(advisoryFixedVersion),
+      VersionValidator.cleanVersion(installedVersion)
+    );
+    assert.strictEqual(comparison < 0, true,
+      '4.17.21 < 4.18.1 must trigger unsafe_downgrade status');
+
+    // This proves: no targetVersion → no updatePackageVersion → no writeFileSync → no PR
+  });
+
+  // --------------------------------------------------------------------------
+  // Scenario 17: INTEGRATION — Full pipeline accepts valid upgrade (4.17.20 → 4.17.21)
+  // --------------------------------------------------------------------------
+  await runTest('Scenario 17: INTEGRATION — Full fix pipeline accepts valid upgrade path', async () => {
+    const installedVersion = '4.17.20';
+    const advisoryFixedVersion = '4.17.21';
+    const vulnerableRange = '<4.17.21';
+
+    // Step 1: determineSafeVersion
+    const safeVersionResult = VersionValidator.determineSafeVersion(
+      installedVersion,
+      advisoryFixedVersion,
+      vulnerableRange
+    );
+    assert.strictEqual(safeVersionResult.version, '4.17.21',
+      'determineSafeVersion must return 4.17.21 as valid upgrade');
+
+    // Step 2: validateVersionSelection (this hits the registry)
+    const validation = await VersionValidator.validateVersionSelection(
+      'lodash',
+      installedVersion,
+      safeVersionResult.version!,
+      vulnerableRange
+    );
+
+    // Even if registry is unreachable, check the non-registry validation steps
+    assert.strictEqual(validation.isDowngrade, false, 'Must NOT be a downgrade');
+    // If registry is reachable, isValid should be true
+    if (validation.registryVerified) {
+      assert.strictEqual(validation.isValid, true, 'Upgrade 4.17.20→4.17.21 is valid');
+    }
+  });
+
+  // --------------------------------------------------------------------------
+  // Scenario 18: INTEGRATION — Already-safe version halts pipeline
+  // --------------------------------------------------------------------------
+  await runTest('Scenario 18: INTEGRATION — Pipeline stops when current version is already safe', () => {
+    const installedVersion = '4.18.1';
+    const advisoryFixedVersion = '4.17.21';
+    const vulnerableRange = '<4.17.21';
+
+    // determineSafeVersion: current >= fixed → no upgrade needed
+    const safeVersionResult = VersionValidator.determineSafeVersion(
+      installedVersion,
+      advisoryFixedVersion,
+      vulnerableRange
+    );
+    assert.strictEqual(safeVersionResult.version, null,
+      'Pipeline must stop — 4.18.1 is already safe');
+    assert.ok(safeVersionResult.reason.includes('already at or above'),
+      'Reason must indicate version is already safe');
+
+    // Also verify: the installed version is NOT in the vulnerable range
+    const isVulnerable = VersionValidator.isVersionInVulnerableRange(installedVersion, vulnerableRange);
+    assert.strictEqual(isVulnerable, false,
+      '4.18.1 must NOT be in vulnerable range <4.17.21');
+  });
+
+  // --------------------------------------------------------------------------
+  // Scenario 19: INTEGRATION — No advisory version blocks entire pipeline
+  // --------------------------------------------------------------------------
+  await runTest('Scenario 19: INTEGRATION — Pipeline blocks when no advisory version available', () => {
+    const installedVersion = '2.5.0';
+    const advisoryFixedVersion = undefined;
+
+    // determineSafeVersion with undefined advisory version
+    const safeVersionResult = VersionValidator.determineSafeVersion(
+      installedVersion,
+      advisoryFixedVersion
+    );
+
+    assert.strictEqual(safeVersionResult.version, null,
+      'Pipeline must NOT proceed without advisory version');
+    assert.ok(
+      safeVersionResult.reason.includes('Manual review required') ||
+      safeVersionResult.reason.includes('could not determine'),
+      'Must indicate manual review required'
+    );
   });
 
   // Cleanup

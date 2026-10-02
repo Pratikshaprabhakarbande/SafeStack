@@ -15,7 +15,19 @@ export interface IFix extends Document {
     | 'retrying'
     | 'completed'
     | 'reverted'
-    | 'failed';
+    | 'failed'
+    | 'unsafe_downgrade'
+    | 'manual_review_required';
+  versionValidation?: {
+    isValid: boolean;
+    isDowngrade: boolean;
+    currentVersion: string;
+    recommendedVersion: string;
+    reason: string;
+    registryVerified: boolean;
+    advisoryFixedVersion?: string;
+    vulnerableRange?: string;
+  };
   packagesBefore?: any;
   packagesAfter?: any;
   updatedPackages: Array<{
@@ -59,9 +71,12 @@ const fixSchema = new Schema<IFix>(
         'completed',
         'reverted',
         'failed',
+        'unsafe_downgrade',
+        'manual_review_required',
       ],
       default: 'queued',
     },
+    versionValidation: Schema.Types.Mixed,
     packagesBefore: Schema.Types.Mixed,
     packagesAfter: Schema.Types.Mixed,
     updatedPackages: [

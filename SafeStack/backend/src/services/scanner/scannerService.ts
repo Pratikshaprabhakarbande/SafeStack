@@ -152,6 +152,7 @@ export class ScannerService {
         packageName: vuln.packageName,
         currentVersion: vuln.currentVersion,
         recommendedVersion,
+        vulnerableRange: vuln.vulnerableRange || vuln.currentVersion,
         isDirect: dependency?.isDirect ?? true,
         cveId: vuln.cve?.[0],
         osvId: vuln.osvId,
